@@ -12,7 +12,7 @@ Use Marvarid's mapper (self.mapper) to go between your policy's joint order and
 the canonical order. Never index joints by hand.
 """
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from harness.types import RobotState, JointCommand, NUM_JOINTS
@@ -55,7 +55,16 @@ class PolicyAdapter(ABC):
     def reference(self, t: float) -> Optional[Dict[str, np.ndarray]]:
         """Motion-tracking policies (BeyondMimic, SONIC, ...): return the reference the policy is
         supposed to track at time t, e.g. {"q": canonical[29]} and optionally
-        {"q_mask": bool[29]}. Enables the tracking-error metric. Velocity policies return None."""
+        {"q_mask": bool[29]}. Enables the tracking-error metric. Velocity policies return None.
+        Adding {"root_pos": xyz, "root_quat": wxyz} (pelvis, world) scores it as a motion tracker (README §3d)."""
+        return None
+
+    def motion_duration(self) -> Optional[float]:
+        """Episode length in seconds for motion trackers. None keeps the scenario's 10 s."""
+        return None
+
+    def default_base_pose(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """(pelvis xyz, pelvis quaternion wxyz) to spawn at; the harness sets the height. None: origin."""
         return None
 
     def describe(self) -> Dict[str, Any]:

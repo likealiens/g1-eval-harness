@@ -11,6 +11,7 @@ opencv-python>=4.8
 # Policies: install the one your adapter needs
 # torch>=2.0            # TorchScript policies (example adapter falls back to numpy without it)
 # onnxruntime>=1.16     # ONNX policies (e.g. BeyondMimic exports)
+# onnx, scipy           # motion-tracking adapters (README §3d): onnx for BeyondMimic, scipy for SONIC
 
 # Optional: external stacks over Unitree DDS (adapters/external/unitree_dds_bridge.py)
 # unitree_sdk2py

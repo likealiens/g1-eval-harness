@@ -27,8 +27,9 @@ sys.path.insert(0, REPO_ROOT)
 
 import numpy as np  # noqa: E402
 
-from harness.config import HarnessConfig, HARNESS_VERSION  # noqa: E402
-from harness.engine import SimulationEngine  # noqa: E402
+from harness.config import (DEFAULT_ROBOT, HARNESS_VERSION, REAL_FALL_HEAD_HEIGHT_M, REAL_FALL_TIME_S,  # noqa: E402
+                            ROBOT_MODELS, HarnessConfig)
+from harness.engine import SimulationEngine, is_motion_tracker  # noqa: E402
 from harness.metrics import aggregate  # noqa: E402
 from harness.reporting import save_trial_log, save_video, write_summary, markdown_table  # noqa: E402
 from harness.scenarios import TEST_SCENARIOS, DEFAULT_SCENARIOS  # noqa: E402
@@ -94,15 +95,22 @@ def main():
     ap.add_argument("--checkpoint", default=None, help="policy weights (.pt/.onnx/...), if the adapter needs one")
     ap.add_argument("--adapter-config", default=None, help="YAML/JSON file passed to the adapter as `config`")
     ap.add_argument("--set", action="append", metavar="KEY=VALUE", help="adapter config override (repeatable)")
-    ap.add_argument("--scenarios", nargs="+", default=DEFAULT_SCENARIOS, help=f"default: all ({', '.join(DEFAULT_SCENARIOS)})")
+    ap.add_argument("--scenarios", nargs="+", default=None,
+                    help=f"default: all ({', '.join(DEFAULT_SCENARIOS)}); motion trackers skip stand_still")
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--cmd-vel", nargs=3, type=float, default=[0.5, 0.0, 0.0], metavar=("VX", "VY", "YAW_RATE"))
+    ap.add_argument("--robot", choices=sorted(ROBOT_MODELS), default=DEFAULT_ROBOT,
+                    help="robot model: ros2 (default) or unitree_rl_gym (v1 model)")
     ap.add_argument("--gains", choices=["policy", "harness"], default="policy",
                     help="policy: each policy sends its own kp/kd (like on hardware). harness: force G1 reference gains.")
     ap.add_argument("--output-dir", default=None, help="default: results/<adapter>_<timestamp>")
     ap.add_argument("--no-video", action="store_true")
     ap.add_argument("--video-all-seeds", action="store_true")
     ap.add_argument("--list-scenarios", action="store_true")
+    ap.add_argument("--stop-at-tracking-failure", action="store_true",
+                    help="motion trackers: end the episode at the first tracking failure (BeyondMimic's termination). "
+                         "Default: keep running until the motion ends or the robot really falls (head below 0.5 m "
+                         "for over 2 s, or still down when the motion ends); see METRICS.md")
     args = ap.parse_args()
 
     if args.list_scenarios:
@@ -110,15 +118,19 @@ def main():
             print(f"{s.name:24s} {s.description}")
         return 0
 
-    unknown = [s for s in args.scenarios if s not in TEST_SCENARIOS]
+    unknown = [s for s in args.scenarios or [] if s not in TEST_SCENARIOS]
     if unknown:
         ap.error(f"Unknown scenarios {unknown}. Use --list-scenarios.")
 
-    cfg = HarnessConfig(gains_mode=args.gains)
+    cfg = HarnessConfig(gains_mode=args.gains, model_xml=ROBOT_MODELS[args.robot])
     adapter_cls = load_adapter_class(args.adapter)
     adapter = adapter_cls(checkpoint_path=args.checkpoint,
                           config=load_adapter_config(args.adapter_config, args.set))
     name = getattr(adapter, "name", adapter_cls.__name__)
+    tracker = is_motion_tracker(adapter.reference(0.0))
+    skipped = args.scenarios is None and tracker
+    if args.scenarios is None:
+        args.scenarios = [s for s in DEFAULT_SCENARIOS if not (tracker and s == "stand_still")]
 
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out = args.output_dir or os.path.join("results", f"{name}_{stamp}")
@@ -130,7 +142,13 @@ def main():
     command = np.array(args.cmd_vel, dtype=np.float64)
 
     print(f"\n[HARNESS {HARNESS_VERSION}] policy={name}  scenarios={len(args.scenarios)}  seeds={args.seeds}")
-    print(f"  physics {1/cfg.physics_dt:.0f} Hz | control {1/cfg.control_dt:.0f} Hz | gains: {cfg.gains_mode} | cmd {command.tolist()}")
+    cmd = "n/a (motion tracker)" if tracker else command.tolist()
+    print(f"  physics {1/cfg.physics_dt:.0f} Hz | control {1/cfg.control_dt:.0f} Hz | gains: {cfg.gains_mode} | cmd {cmd}")
+    print(f"  robot model: {args.robot} ({os.path.basename(cfg.model_xml)})")
+    print("  policy type: " + ("motion tracker (reference(t) has a root pose)" if tracker
+                               else "walking (no root pose in reference(t))"))
+    if skipped:
+        print("  stand_still skipped: a motion tracker ignores the speed command (ask for it with --scenarios)")
     print(f"  output -> {out}\n")
 
     trials, aggregates, perturbations = {}, {}, {}
@@ -141,15 +159,23 @@ def main():
             trials[scen_name], perturbations[scen_name] = {}, {}
             for i, seed in enumerate(args.seeds):
                 record = (not args.no_video) and (i == 0 or args.video_all_seeds)
-                res = engine.run_trial(adapter, scen, seed, command, record_video=record)
+                res = engine.run_trial(adapter, scen, seed, command, record_video=record,
+                                       stop_at_tracking_failure=args.stop_at_tracking_failure)
                 m = res.metrics
                 trials[scen_name][f"seed_{seed}"] = m.to_dict()
                 perturbations[scen_name][f"seed_{seed}"] = res.perturbations
                 save_trial_log(res.log, os.path.join(out, "logs", f"{scen_name}_seed{seed}.npz"))
                 status = f"FELL ({m.fall_reason} @ {m.time_to_fall_s:.2f}s)" if m.fall else "ok"
-                v = "n/a" if not np.isfinite(m.lin_vel_xy_rmse) else f"{m.lin_vel_xy_rmse:.3f}"
+                if m.fell is not None:
+                    status = (f"track-fail ({m.tracking_failure_reason} @ {m.tracking_failure_time_s:.2f}s)"
+                              if m.tracking_failure else "tracking ok") + ", " + \
+                             (f"FELL ({m.fell_reason} @ {m.fell_time_s:.2f}s)" if m.fell else "no fall")
+                if np.isfinite(m.mpkpe_m):  # motion tracker
+                    score = f"MPKPE {m.mpkpe_m:6.3f}"
+                else:
+                    score = "v_xy rmse " + ("   n/a" if not np.isfinite(m.lin_vel_xy_rmse) else f"{m.lin_vel_xy_rmse:6.3f}")
                 print(f"  {scen_name:22s} seed {seed:<4d} {status:36s} surv {m.survival_fraction:4.2f} | "
-                      f"v_xy rmse {v:>6s} | act-rate {m.action_rate_rms:6.2f} | power {m.mean_mech_power_w:6.0f} W")
+                      f"{score} | act-rate {m.action_rate_rms:6.2f} | power {m.mean_mech_power_w:6.0f} W")
                 if record and res.frames:
                     vp = os.path.join(out, "videos", f"{scen_name}_seed{seed}.mp4")
                     if save_video(res.frames, vp, fps=int(round(1 / (cfg.control_dt * cfg.video_stride)))):
@@ -161,8 +187,8 @@ def main():
     summary = {
         "created": dt.datetime.now().isoformat(timespec="seconds"),
         "harness": cfg.to_dict(),
-        "robot": engine.robot.describe(),
-        "adapter": {"name": name, "class": f"{adapter_cls.__module__}.{adapter_cls.__name__}",
+        "robot": {"model": args.robot, **engine.robot.describe()},
+        "adapter": {"name": name, "policy_type": "motion_tracker" if tracker else "walking", "class": f"{adapter_cls.__module__}.{adapter_cls.__name__}",
                     "checkpoint": args.checkpoint, "checkpoint_sha256": sha256(args.checkpoint),
                     "config": adapter.config, "policy_dt": adapter.policy_dt,
                     "command_rate": adapter.command_rate,
@@ -178,6 +204,9 @@ def main():
         "perturbations": perturbations,
         "wall_time_s": round(time.time() - t_start, 1),
     }
+    if tracker and not args.stop_at_tracking_failure:
+        summary["harness"].update(keep_running_after_tracking_failure=True,
+                                  real_fall_head_height_m=REAL_FALL_HEAD_HEIGHT_M, real_fall_time_s=REAL_FALL_TIME_S)
     write_summary(out, summary)
     print("\n" + markdown_table(aggregates))
     print(f"\n[HARNESS] done in {summary['wall_time_s']} s -> {out}/summary.json, summary.md\n")

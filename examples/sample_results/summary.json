@@ -1,7 +1,7 @@
 {
   "created": "2026-11-13T17:00:45",
   "harness": {
-    "model_xml": "C:\\Users\\davlat\\Desktop\\g1-eval-harness\\assets\\g1\\g1_29dof_harness.xml",
+    "model_xml": "assets\\g1\\g1_29dof_harness.xml",
     "physics_dt": 0.002,
     "decimation": 10,
     "gains_mode": "policy",
